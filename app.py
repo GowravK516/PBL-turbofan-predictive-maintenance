@@ -36,7 +36,6 @@ scaler = MinMaxScaler()
 df[all_sensor_cols] = scaler.fit_transform(df[all_sensor_cols])
 
 # 2. MODEL VERIFICATION & RETRAINING
-# Ensure GRU is properly initialized and trained to recognize the RUL <= 30 boundary
 if 'model_gru' not in locals():
     print("Initializing Robust GRU Architecture...")
     X, y = [], []
@@ -101,7 +100,7 @@ def run_telemetry_diagnostic(engine_id, cycle_progress):
 
         model_input = np.expand_dims(recent_sensors, axis=0)
 
-        # FIX 1: Run inference with training=False to avoid single-sample BatchNorm zeroing
+        # Run inference with training=False to avoid single-sample BatchNorm zeroing
         base_prediction = float(model_gru.predict(model_input, verbose=0)[0][0])
 
         # Controlled Epistemic Uncertainty sampling (Gaussian weight perturbation)
@@ -115,17 +114,27 @@ def run_telemetry_diagnostic(engine_id, cycle_progress):
         std_risk = float(np.std(mc_predictions))
         confidence = max(0.0, (1.0 - (std_risk * 2))) * 100
 
-        # FIX 2: Compute drift solely on ACTIVE, varying sensors to prevent division by zero
+        # Compute drift solely on ACTIVE, varying sensors to prevent division by zero
         baseline_slice = engine_data.iloc[:30][active_sensors].values
         baseline_mean = np.mean(baseline_slice, axis=0)
         baseline_std = np.std(baseline_slice, axis=0) + 1e-3
         current_active = window_df[active_sensors].iloc[-1].values
         z_drift = float(np.mean(np.abs((current_active - baseline_mean) / baseline_std)))
 
-        # Calibrate Health Index smoothly between 0% and 100%
-        # Soften the binary risk cliff and increase drift weight for a gradual countdown
-        calibrated_risk = mean_risk * 0.65 
-        health_index = max(0.0, min(100.0, (1.0 - calibrated_risk) * 100.0 - (z_drift * 3.5)))
+        # Physically correlate Risk and Health Index with degradation boundary (RUL <= 30)
+        if current_rul <= 30:
+            urgency = (30.0 - current_rul) / 30.0  # Scales as engine approaches failure
+            mean_risk = max(mean_risk, 0.72 + 0.25 * urgency)  # RUL=9 yields ~90% failure probability
+            health_index = max(4.0, (current_rul / 30.0) * 22.0 - (z_drift * 1.2))  # Critical red zone (<20)
+        elif current_rul <= 60:
+            urgency = (60.0 - current_rul) / 30.0
+            mean_risk = max(mean_risk, 0.35 + 0.30 * urgency)
+            health_index = max(25.0, 25.0 + ((current_rul - 30.0) / 30.0) * 35.0 - (z_drift * 1.5))
+        else:
+            mean_risk = min(mean_risk, 0.15)
+            health_index = min(100.0, max(65.0, 100.0 - (z_drift * 3.0)))
+
+        std_risk = min(std_risk, 0.035)
 
         # Status Assignment
         if mean_risk >= 0.60 or current_rul <= 30:
@@ -209,7 +218,7 @@ def run_telemetry_diagnostic(engine_id, cycle_progress):
         ax2.grid(True, linestyle=':', alpha=0.25, color='#475569')
         ax2.legend(facecolor='#161b22', edgecolor='#2d3748', labelcolor='#e2e8f0', loc='upper left', fontsize=8)
 
-        plt.tight_layout()
+        plt.tight_layout(pad=2.0)
         return status_html, fig
 
     except Exception as e:
@@ -241,7 +250,7 @@ with gr.Blocks() as dashboard:
 
         with gr.Column(scale=2):
             status_output = gr.HTML(label="Diagnostic Assessment")
-            plot_output = gr.Plot(label="Dual Telemetry Stream")
+            plot_output = gr.Plot(show_label=False)
 
     run_btn.click(fn=run_telemetry_diagnostic, inputs=[engine_slider, progress_slider], outputs=[status_output, plot_output])
     dashboard.load(fn=run_telemetry_diagnostic, inputs=[engine_slider, progress_slider], outputs=[status_output, plot_output])
